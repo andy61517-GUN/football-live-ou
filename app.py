@@ -1,218 +1,188 @@
-
 import math
 import requests
 import streamlit as st
-import pandas as pd
-from datetime import datetime, timezone
 
 st.set_page_config(page_title="足球走地大小分分析", page_icon="⚽", layout="wide")
 
-API_BASE = "https://v3.football.api-sports.io"
+API_BASE = st.secrets.get("FOOTBALL_API_BASE", "https://api.5dollarfootballapi.com/v1").rstrip("/")
+API_KEY = st.secrets.get("FOOTBALL_API_KEY", "")
 
-def api_get(path, api_key, params=None):
-    r = requests.get(API_BASE + path, headers={"x-apisports-key": api_key}, params=params or {}, timeout=20)
-    r.raise_for_status()
-    data = r.json()
-    if data.get("errors"):
-        raise RuntimeError(str(data["errors"]))
-    return data.get("response", [])
+st.title("⚽ 足球走地大小分分析")
+st.caption("即時比分與比賽數據｜估算僅供參考，不代表投注結果")
 
-def val_num(x, default=0.0):
-    try:
-        return float(x)
-    except (TypeError, ValueError):
-        return default
+if not API_KEY:
+    st.error("找不到 API Key。請到 Streamlit Cloud → Settings → Secrets，確認 FOOTBALL_API_KEY 已設定。")
+    st.stop()
 
-def norm(s):
-    return str(s or "").strip().lower().replace(" ", "_").replace("-", "_")
 
-def stat_map(rows):
-    out = {}
-    for item in rows or []:
-        k = norm(item.get("type"))
-        v = item.get("value")
+@st.cache_data(ttl=60, show_spinner=False)
+def get_live_fixtures(api_base, api_key):
+    response = requests.get(
+        f"{api_base}/fixtures",
+        headers={"Authorization": f"Bearer {api_key}"},
+        params={"status": "live", "per_page": 50, "include": "stats", "lang": "zh-tw"},
+        timeout=25,
+    )
+    if response.status_code >= 400:
+        try:
+            detail = response.json()
+        except Exception:
+            detail = response.text[:500]
+        raise RuntimeError(f"API 回應 {response.status_code}：{detail}")
+    payload = response.json()
+    if payload.get("success") != 1:
+        raise RuntimeError(f"API 回傳錯誤：{payload}")
+    return payload.get("data") or []
 
-        if isinstance(v, str) and "%" in v:
-            v = v.replace("%", "").strip()
 
-        if v is not None:
-            out[k] = val_num(v, 0)
+def pair_text(obj, suffix=""):
+    if not isinstance(obj, dict) or obj.get("home") is None or obj.get("away") is None:
+        return "尚無資料"
+    return f'{obj["home"]}{suffix} / {obj["away"]}{suffix}'
 
-    return out
 
-def poisson_prob_at_least(lam, n):
-    if n <= 0:
+def poisson_tail(lam, needed):
+    if needed <= 0:
         return 1.0
-    cdf = sum(math.exp(-lam) * lam**k / math.factorial(k) for k in range(n))
-    return max(0.0, min(1.0, 1.0-cdf))
-
-def poisson_prob_at_most(lam, n):
-    if n < 0:
+    if lam <= 0:
         return 0.0
-    return max(0.0, min(1.0, sum(math.exp(-lam) * lam**k / math.factorial(k) for k in range(n+1))))
+    return 1 - sum(math.exp(-lam) * lam**k / math.factorial(k) for k in range(needed))
 
-def get_stat(m, *keys):
-    for k in keys:
-        if k in m:
-            return m[k]
-    return 0.0
 
-def estimate_remaining(home, away, minute, score_total, period, red_home=0, red_away=0):
-    # Transparent heuristic, not a trained model. API-Football xG is used when available.
-    elapsed = min(max(minute, 1), 90)
-    remaining = max(0, 95-elapsed)
-    xg_h = get_stat(home, "expected_goals", "xg")
-    xg_a = get_stat(away, "expected_goals", "xg")
-    shots_h = get_stat(home, "total_shots")
-    shots_a = get_stat(away, "total_shots")
-    sot_h = get_stat(home, "shots_on_goal", "shots on goal")
-    sot_a = get_stat(away, "shots_on_goal", "shots on goal")
-    dangerous_h = get_stat(home, "dangerous_attacks")
-    dangerous_a = get_stat(away, "dangerous_attacks")
+def estimate_lambda(minute, stats, first_half=False):
+    block = (stats or {}).get("first_half", {}) if first_half else (stats or {})
+    remaining = max(0, (45 if first_half else 90) - minute)
+    rate = (1.0 / 45 if first_half else 1.05 / 90)
+    lam = remaining * rate
+    sot = block.get("shots_on_target")
+    dangerous = block.get("dangerous_attacks")
+    if isinstance(sot, dict):
+        count = (sot.get("home") or 0) + (sot.get("away") or 0)
+        lam *= min(1.65, max(0.65, 0.85 + count * 0.055))
+    if isinstance(dangerous, dict):
+        count = (dangerous.get("home") or 0) + (dangerous.get("away") or 0)
+        lam *= min(1.25, max(0.80, 0.90 + count / 300))
+    return max(0.0, min(lam, 3.5))
 
-    # Base live scoring intensity; adjusted by observed threat metrics where available.
-    lam = 1.05 * remaining / 30.0
-    evidence = []
-    if xg_h + xg_a > 0:
-        # Scale live xG to remaining-time intensity without treating accumulated xG as future goals.
-        xg_rate = (xg_h + xg_a) / max(elapsed, 15) * remaining
-        lam = 0.55 * lam + 0.45 * min(2.2, max(0.05, xg_rate * 0.72))
-        evidence.append("有 xG 數據")
-    if shots_h + shots_a > 0:
-        shot_factor = 1 + min(0.30, max(-0.15, ((sot_h+sot_a)/max(shots_h+shots_a,1)-0.30)*0.8))
-        lam *= shot_factor
-        evidence.append("有射門／射正數據")
-    # A trailing side may attack more late; only a modest adjustment.
-    if minute >= 55 and abs(val_num(st.session_state.get("home_goals",0))-val_num(st.session_state.get("away_goals",0))) == 1:
-        lam *= 1.08
-        evidence.append("一球差距的後段比分修正")
-    if red_home + red_away:
-        # Red cards increase variance, not reliably the mean. Small adjustment only.
-        lam *= 1.04
-        evidence.append("有紅牌：模型不確定性提高")
-    lam = max(0.02, min(4.0, lam))
-    return lam, remaining, evidence, {"xg": xg_h+xg_a, "shots": shots_h+shots_a, "sot": sot_h+sot_a}
 
-def asian_over_under(lam, current_goals, line):
-    # Whole/half/quarter totals approximated by adjacent half-point lines.
-    # Push probability is reported for integer lines.
-    over_need = math.floor(line - current_goals) + 1
-    under_max = math.ceil(line - current_goals) - 1
-    p_over = poisson_prob_at_least(lam, max(0, over_need))
-    p_under = poisson_prob_at_most(lam, under_max)
-    push = 0.0
-    if abs((line-current_goals) - round(line-current_goals)) < 1e-8:
-        n = int(round(line-current_goals))
-        if n >= 0:
-            push = math.exp(-lam)*lam**n/math.factorial(n)
-    return p_over, p_under, push
+def ou_probabilities(current_goals, line, lam):
+    adjusted = float(line) - current_goals
+    if abs(adjusted - round(adjusted)) < 1e-9:
+        n = int(round(adjusted))
+        over = poisson_tail(lam, n + 1)
+        under = poisson_tail(lam, n)
+        push = math.exp(-lam) * lam**n / math.factorial(n) if n >= 0 else 0.0
+        return over, under, push
+    return poisson_tail(lam, math.floor(adjusted) + 1), poisson_tail(lam, math.ceil(adjusted)), 0.0
 
-st.title("⚽ 足球走地大小分分析系統")
-st.caption("手機優先介面｜全場＋上半場｜即時賽事與統計需 API-Football 金鑰")
-with st.sidebar:
-    st.header("資料連線")
-    api_key = st.text_input("API-Football API Key", type="password", help="到 dashboard.api-football.com 註冊取得。金鑰只在本次執行的介面中使用，不要貼到公開程式碼。")
-    st.caption("API-Football 免費方案可能有每日請求額度及賽事統計覆蓋限制。")
-    refresh = st.button("↻ 重新抓取即時賽事", use_container_width=True)
-    st.divider()
-    st.caption("模型說明：這是透明的基礎估算模型，並非經歷史回測校準的專業預測器。")
 
-if not api_key:
-    st.info("先在左側輸入 API-Football API Key，再載入即時賽事。")
-    st.markdown("**取得方式：** [API-Football 官方網站](https://www.api-football.com/) → 註冊 → Dashboard → 複製 API Key。")
-    st.markdown("上線前請先確認你的方案允許即時賽事與 fixtures statistics。")
-    st.stop()
+def label_fixture(f):
+    teams = f.get("teams") or {}
+    home = (teams.get("home") or {}).get("name", "主隊")
+    away = (teams.get("away") or {}).get("name", "客隊")
+    goals = f.get("goals") or {}
+    score = f'{goals.get("home") if goals.get("home") is not None else "-"} : {goals.get("away") if goals.get("away") is not None else "-"}'
+    league = (f.get("league") or {}).get("name", "未知聯賽")
+    return f'{league}｜{home} {score} {away}｜{f.get("status_code") or "進行中"}'
 
-if "fixtures" not in st.session_state or refresh:
-    try:
-        with st.spinner("正在取得即時比賽…"):
-            st.session_state.fixtures = api_get("/fixtures", api_key, {"live":"all"})
-    except Exception as e:
-        st.error(f"讀取即時賽事失敗：{e}")
-        st.stop()
-
-fixtures = st.session_state.fixtures
-if not fixtures:
-    st.warning("目前 API 沒有回傳進行中的比賽。可稍後重新整理，或確認 API 方案權限。")
-    st.stop()
-
-options = {}
-for f in fixtures:
-    teams=f.get("teams",{})
-    goals=f.get("goals",{})
-    status=f.get("fixture",{}).get("status",{})
-    minute=status.get("elapsed") or 0
-    label=f"{teams.get('home',{}).get('name','主隊')} {goals.get('home') or 0}-{goals.get('away') or 0} {teams.get('away',{}).get('name','客隊')}｜{minute}'"
-    options[label]=f
-
-selected_label = st.selectbox("選擇進行中的比賽", list(options.keys()))
-fixture=options[selected_label]
-fid=fixture["fixture"]["id"]
-teams=fixture["teams"]
-goals=fixture["goals"]
-home_name=teams["home"]["name"]; away_name=teams["away"]["name"]
-hg=int(goals.get("home") or 0); ag=int(goals.get("away") or 0)
-minute=int(fixture["fixture"]["status"].get("elapsed") or 0)
-status_short=fixture["fixture"]["status"].get("short","")
-st.session_state.home_goals=hg; st.session_state.away_goals=ag
 
 try:
-    with st.spinner("讀取比賽統計…"):
-        raw_stats=api_get("/fixtures/statistics",api_key,{"fixture":fid})
-    home_stats=stat_map(raw_stats[0].get("statistics",[])) if len(raw_stats)>0 else {}
-    away_stats=stat_map(raw_stats[1].get("statistics",[])) if len(raw_stats)>1 else {}
-except Exception as e:
-    home_stats={}; away_stats={}
-    st.warning(f"暫時無法取得詳細統計，將使用比分與時間基準估算。原因：{e}")
+    fixtures = get_live_fixtures(API_BASE, API_KEY)
+except requests.exceptions.RequestException as exc:
+    st.error(f"連線失敗：{exc}")
+    st.stop()
+except Exception as exc:
+    st.error(str(exc))
+    st.info("請確認 API Key、方案權限與 API 服務狀態。")
+    st.stop()
 
-red_h=get_stat(home_stats,"red_cards"); red_a=get_stat(away_stats,"red_cards")
-lam, remaining, evidence, raw=estimate_remaining(home_stats,away_stats,minute,hg+ag,"full",red_h,red_a)
+a, b = st.columns([3, 1])
+a.write(f"目前取得 **{len(fixtures)}** 場進行中比賽")
+if b.button("🔄 重新整理", use_container_width=True):
+    get_live_fixtures.clear()
+    st.rerun()
 
-c1,c2,c3=st.columns(3)
-c1.metric("比賽時間", f"{minute}'")
-c2.metric("目前比分", f"{hg} - {ag}")
-c3.metric("目前總進球", hg+ag)
-st.subheader("即時比賽數據")
-rows=[]
-for label,key in [("射門","total_shots"),("射正","shots_on_goal"),("危險進攻","dangerous_attacks"),("控球率","ball_possession"),("角球","corner_kicks"),("紅牌","red_cards"),("預期進球 xG","expected_goals")]:
-    hv=get_stat(home_stats,key); av=get_stat(away_stats,key)
-    rows.append({"數據":label,home_name:hv,away_name:av})
-st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+if not fixtures:
+    st.info("目前沒有 API 回傳的進行中比賽，請稍後重新整理。")
+    st.markdown("[資料來源：5DollarFootballAPI](https://5dollarfootballapi.com/)")
+    st.stop()
 
-st.subheader("全場大小分分析")
-st.metric("模型預測剩餘進球期望", f"{lam:.2f}", help="簡化啟發式模型估算，不是保證結果。")
-st.metric("模型預測最終總進球期望", f"{hg+ag+lam:.2f}")
-line_full=st.number_input("輸入目前全場大小盤（例如 2.5、3.0、3.25）", min_value=0.5, max_value=8.0, value=2.5, step=0.25)
-pov, pun, push=asian_over_under(lam,hg+ag,line_full)
-a,b,c=st.columns(3)
-a.metric("大球估計機率",f"{pov*100:.1f}%")
-b.metric("小球估計機率",f"{pun*100:.1f}%")
-c.metric("走盤機率（整數盤）",f"{push*100:.1f}%")
+labels = [label_fixture(f) for f in fixtures]
+chosen = st.selectbox("選擇比賽", labels)
+fixture = fixtures[labels.index(chosen)]
 
-st.subheader("上半場大小分分析")
-ht=fixture.get("score",{}).get("halftime",{}) or {}
-ht_total=(ht.get("home") or 0)+(ht.get("away") or 0)
-if minute <= 45:
-    ht_elapsed=max(1,minute)
-    ht_remaining=max(0,50-minute)
-    ht_lam=1.05*ht_remaining/30
-    if raw["xg"]>0:
-        ht_lam=0.65*ht_lam+0.35*min(1.6,raw["xg"]/max(minute,15)*ht_remaining*0.72)
-    ht_line=st.number_input("輸入上半場大小盤",min_value=0.5,max_value=5.0,value=1.5,step=0.25)
-    hp_over,hp_under,hp_push=asian_over_under(ht_lam,hg+ag,ht_line)
-    x,y,z=st.columns(3)
-    x.metric("上半場預測剩餘進球",f"{ht_lam:.2f}")
-    y.metric("上半場大球機率",f"{hp_over*100:.1f}%")
-    z.metric("上半場小球機率",f"{hp_under*100:.1f}%")
+teams = fixture.get("teams") or {}
+home = (teams.get("home") or {}).get("name", "主隊")
+away = (teams.get("away") or {}).get("name", "客隊")
+goals = fixture.get("goals") or {}
+hg, ag = goals.get("home") or 0, goals.get("away") or 0
+total_goals = hg + ag
+status_code = str(fixture.get("status_code") or "")
+half_time = status_code.lower() == "half"
+minute = int(status_code) if status_code.isdigit() else (45 if half_time else 0)
+stats = fixture.get("statistics") or {}
+if not stats and isinstance(fixture.get("stats"), dict):
+    stats = fixture["stats"].get("statistics") or fixture["stats"]
+
+st.subheader(f"{home}  vs  {away}")
+st.caption(f'{(fixture.get("league") or {}).get("name", "未知聯賽")}｜{ "中場休息" if half_time else (str(minute) + " 分鐘" if minute else "進行中")}')
+c1, c2, c3 = st.columns(3)
+c1.metric(home, hg)
+c2.metric("目前總進球", total_goals)
+c3.metric(away, ag)
+
+st.markdown("### 📊 比賽數據")
+sot, soff = stats.get("shots_on_target"), stats.get("shots_off_target")
+shots = None
+if isinstance(sot, dict) and isinstance(soff, dict) and all(
+    sot.get(k) is not None and soff.get(k) is not None for k in ("home", "away")
+):
+    shots = {"home": sot["home"] + soff["home"], "away": sot["away"] + soff["away"]}
+cards = fixture.get("cards") or {}
+hc, ac = cards.get("home") or {}, cards.get("away") or {}
+red = (hc.get("red") or 0) + (ac.get("red") or 0)
+red_text = str(red) if hc.get("red") is not None and ac.get("red") is not None else "尚無資料"
+items = [
+    ("總射門", pair_text(shots)), ("射正", pair_text(sot)), ("射偏", pair_text(soff)),
+    ("危險進攻", pair_text(stats.get("dangerous_attacks"))),
+    ("總進攻", pair_text(stats.get("attacks"))),
+    ("控球率", pair_text(stats.get("possession"), "%")),
+    ("角球", pair_text(fixture.get("corners"))), ("紅牌", red_text),
+]
+grid = st.columns(4)
+for i, (name, value) in enumerate(items):
+    grid[i % 4].metric(name, value)
+if not stats:
+    st.warning("這場比賽尚未取得統計資料；缺少數據會顯示「尚無資料」，不會假裝是 0。")
+
+st.markdown("### 🎯 大小分估算")
+st.caption("輸入目前盤口。估算為簡化 Poisson 節奏模型，不是莊家賠率或保證命中率。")
+full_line = st.number_input("全場大小分盤口", 0.5, 10.0, 2.5, 0.25)
+half_line = st.number_input("上半場大小分盤口", 0.5, 5.0, 1.0, 0.25)
+
+lam = estimate_lambda(minute, stats)
+over, under, push = ou_probabilities(total_goals, full_line, lam)
+x, y, z = st.columns(3)
+x.metric("全場預估剩餘進球", f"{lam:.2f}")
+y.metric("大分估算", f"{over:.1%}")
+z.metric("小分估算", f"{under:.1%}")
+if push > 0.001:
+    st.caption(f"整數盤走水機率約 {push:.1%}（模型估算）。")
+
+st.divider()
+st.markdown("#### 上半場大小分")
+if half_time or minute > 45:
+    st.info("比賽已進入中場或下半場，上半場已結束，不再估算上半場剩餘進球。")
 else:
-    st.info(f"比賽已進入下半場。上半場完場比分：{ht.get('home','?')} - {ht.get('away','?')}；上半場盤口不再提供即時下注判斷。")
+    half_lam = estimate_lambda(minute, stats, first_half=True)
+    ho, hu, hp = ou_probabilities(total_goals, half_line, half_lam)
+    x, y, z = st.columns(3)
+    x.metric("上半場預估剩餘進球", f"{half_lam:.2f}")
+    y.metric("上半場大分估算", f"{ho:.1%}")
+    z.metric("上半場小分估算", f"{hu:.1%}")
+    if hp > 0.001:
+        st.caption(f"上半場整數盤走水機率約 {hp:.1%}。")
 
-st.subheader("模型資料品質與判讀")
-if evidence:
-    st.write("目前可用訊號：" + "、".join(evidence))
-else:
-    st.warning("目前缺少射門或 xG 等細部數據，預測主要依賴時間基準，可信度偏低。")
-if raw["xg"] == 0:
-    st.warning("沒有取得 xG。請勿把此結果視為高信心訊號。")
-st.caption("重要：API 統計可能延遲、缺漏或不涵蓋所有聯賽。此工具不含自動賠率來源；盤口需依球版即時數字手動輸入。")
-st.caption("預測機率未經足量歷史回測與校準，不構成投注建議。請設定預算並避免追損。")
+st.warning("此模型未完整納入球隊實力、紅牌發生時間、戰術變化及即時盤口，請勿單憑估算下注。")
+st.markdown("---")
+st.markdown("資料來源：[5DollarFootballAPI](https://5dollarfootballapi.com/)｜資料快取 60 秒")
