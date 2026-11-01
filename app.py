@@ -4,6 +4,22 @@ import streamlit as st
 
 st.set_page_config(page_title="足球＋NBA 走地大小分分析", page_icon="🏀", layout="wide")
 
+# 個人使用密碼閘門：請在 Streamlit Secrets 設定 APP_PASSWORD
+app_password = st.secrets.get("APP_PASSWORD", "")
+if not app_password:
+    st.error("尚未設定個人使用密碼。請至 Streamlit Cloud → Settings → Secrets 新增 APP_PASSWORD。")
+    st.stop()
+if not st.session_state.get("authenticated", False):
+    st.title("🔒 個人分析網站登入")
+    entered = st.text_input("請輸入個人使用密碼", type="password")
+    if st.button("登入"):
+        if entered == app_password:
+            st.session_state["authenticated"] = True
+            st.rerun()
+        else:
+            st.error("密碼錯誤，請再試一次。")
+    st.stop()
+
 st.title("⚽🏀 足球＋NBA 走地大小分分析")
 sport_tab = st.radio("選擇分析項目", ["⚽ 足球", "🏀 NBA"], horizontal=True)
 
@@ -26,6 +42,102 @@ def ou_probabilities(current_points, line, lam):
 
 def pct(x):
     return f"{x:.1%}"
+
+
+# ---------------- THE RUNDOWN PRE-MATCH ODDS ----------------
+TR_BASE = "https://therundown.io/api/v2"
+SOCCER_SPORTS = {
+    "MLS": 10, "英超 EPL": 11, "法甲 Ligue 1": 12, "德甲 Bundesliga": 13,
+    "西甲 La Liga": 14, "義甲 Serie A": 15, "歐冠 Champions League": 16,
+    "世界盃 FIFA": 18, "日職 J1 League": 19, "Liga MX": 34,
+}
+
+@st.cache_data(ttl=300, show_spinner=False)
+def rundown_events(api_key, sport_id, date_text):
+    url = f"{TR_BASE}/sports/{sport_id}/events/{date_text}"
+    params = {"market_ids": "1,2,3", "affiliate_ids": "3,19,23", "main_line": "true", "hide_closed": "true"}
+    response = requests.get(url, headers={"X-TheRundown-Key": api_key}, params=params, timeout=25)
+    response.raise_for_status()
+    return response.json()
+
+def _walk_prices(obj, market_name=""):
+    """Flatten V2 market payloads without assuming every book returns every line."""
+    rows = []
+    if isinstance(obj, dict):
+        if any(k in obj for k in ("price", "odds")) and any(k in obj for k in ("participant", "name", "team", "label")):
+            rows.append(obj)
+        for key, value in obj.items():
+            if key in ("markets", "participants", "lines", "prices", "outcomes"):
+                rows.extend(_walk_prices(value, market_name))
+            elif isinstance(value, (dict, list)):
+                rows.extend(_walk_prices(value, market_name))
+    elif isinstance(obj, list):
+        for item in obj:
+            rows.extend(_walk_prices(item, market_name))
+    return rows
+
+def show_prematch_odds(sport_id, sport_label):
+    st.markdown("### 📊 賽前盤口（TheRundown）")
+    api_key = st.secrets.get("THERUNDOWN_API_KEY", "")
+    if not api_key:
+        st.warning("尚未設定 THERUNDOWN_API_KEY，請在 Streamlit Secrets 新增。")
+        return
+    from datetime import datetime
+    date_text = datetime.now().strftime("%Y-%m-%d")
+    col1, col2 = st.columns([3, 1])
+    col1.caption(f"{sport_label}｜免費方案｜約 5 分鐘延遲｜僅賽前全場主盤")
+    if col2.button("🔄 更新賽前盤口", key=f"refresh_odds_{sport_id}", use_container_width=True):
+        rundown_events.clear()
+        st.rerun()
+    try:
+        payload = rundown_events(api_key, sport_id, date_text)
+    except requests.HTTPError as e:
+        code = getattr(e.response, "status_code", "未知")
+        st.error(f"盤口 API 請求失敗（HTTP {code}）。請檢查 API Key、方案權限或額度。")
+        return
+    except Exception as e:
+        st.error(f"盤口資料讀取失敗：{e}")
+        return
+    events = payload.get("events") or []
+    if not events:
+        st.info("今天尚無符合條件的賽前盤口，或該聯盟今日沒有賽事。")
+        return
+    def ev_label(ev):
+        teams = ev.get("teams") or []
+        if isinstance(teams, dict):
+            names = [str(v.get("name", "")) for v in teams.values() if isinstance(v, dict)]
+        else:
+            names = [str(t.get("name") or t.get("display_name") or "") for t in teams if isinstance(t, dict)]
+        return " vs ".join([x for x in names if x]) or str(ev.get("event_id") or ev.get("id") or "未命名賽事")
+    labels = [ev_label(ev) for ev in events]
+    chosen = st.selectbox("選擇要查看的賽事", labels, key=f"odds_event_{sport_id}")
+    event = events[labels.index(chosen)]
+    markets = event.get("markets") or []
+    if not markets:
+        st.info("此場目前沒有回傳可用的主盤資料。")
+        return
+    rows = []
+    for market in markets:
+        mid = market.get("market_id") or market.get("id")
+        mname = market.get("name") or ({1:"勝負",2:"讓分",3:"大小分"}.get(mid, f"市場 {mid}"))
+        for part in market.get("participants") or []:
+            pname = part.get("name") or part.get("participant") or part.get("type") or "選項"
+            for line in part.get("lines") or []:
+                line_val = line.get("line") or line.get("value") or "主盤"
+                for price in line.get("prices") or []:
+                    book = price.get("affiliate_name") or price.get("affiliate") or price.get("book") or price.get("sportsbook") or "莊家"
+                    odds = price.get("price") or price.get("odds")
+                    if str(odds) == "0.0001":
+                        continue
+                    rows.append({"市場": mname, "選項": pname, "盤口": line_val, "莊家": book, "賠率": odds})
+    if rows:
+        st.dataframe(rows, hide_index=True, use_container_width=True)
+        st.caption("只呈現 API 實際回傳的價格；不同市場的選項不可直接互相比較。資料約延遲 5 分鐘。")
+    else:
+        st.info("已取得賽事，但目前回傳格式或該場盤口沒有可顯示的價格。可展開查看 API 原始資料。")
+        with st.expander("查看 API 原始資料（除錯）"):
+            st.json(event)
+
 
 # ---------------- FOOTBALL ----------------
 def football_page():
@@ -161,7 +273,10 @@ def football_page():
         a.metric("上半場預估剩餘進球", f"{hlam:.2f}")
         b.metric("上半場大分估算", pct(ho))
         c.metric("上半場小分估算", pct(hu))
-    st.caption("足球估算為簡化 Poisson 節奏模型，非保證命中率。資料來源：[5DollarFootballAPI](https://5dollarfootballapi.com/)")
+    st.caption("足球估算為簡化 Poisson 節奏模型，非保證命中率。資料來源：[5DollarFootballAPI](https://5dollarfootballapi/)")
+    st.markdown("#### 足球賽前盤口")
+    league_choice = st.selectbox("選擇賽前盤口聯盟", list(SOCCER_SPORTS.keys()), key="soccer_odds_league")
+    show_prematch_odds(SOCCER_SPORTS[league_choice], league_choice)
 
 # ---------------- NBA ----------------
 def nba_page():
@@ -300,6 +415,7 @@ def nba_page():
     else:
         st.info("比賽尚未開打。可先查看賽程；開賽後會顯示走地總分估算。")
     st.caption("NBA 資料來源：[ESPN](https://www.espn.com/nba/)｜比分快取 30 秒")
+    show_prematch_odds(4, "NBA")
 
 if sport_tab == "⚽ 足球":
     football_page()
