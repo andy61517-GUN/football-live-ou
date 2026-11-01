@@ -24,16 +24,20 @@ def val_num(x, default=0.0):
         return default
 
 def norm(s):
-    return str(s or "").strip().lower()
+    return str(s or "").strip().lower().replace(" ", "_").replace("-", "_")
 
 def stat_map(rows):
     out = {}
     for item in rows or []:
         k = norm(item.get("type"))
         v = item.get("value")
+
         if isinstance(v, str) and "%" in v:
-            v = v.replace("%", "")
-        out[k] = val_num(v, 0)
+            v = v.replace("%", "").strip()
+
+        if v is not None:
+            out[k] = val_num(v, 0)
+
     return out
 
 def poisson_prob_at_least(lam, n):
