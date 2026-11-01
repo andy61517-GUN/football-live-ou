@@ -275,3 +275,401 @@ def show_prematch_odds(sport_id, sport_label):
         st.info("目前沒有可顯示的盤口價格。")
         with st.expander("查看 API 原始資料"):
             st.json(event)
+# ---------------- 足球走地分析 ----------------
+
+FOOTBALL_BASE = st.secrets.get(
+    "FOOTBALL_API_BASE",
+    "https://api.5dollarfootballapi.com/v1"
+).rstrip("/")
+
+FOOTBALL_KEY = st.secrets.get("FOOTBALL_API_KEY", "")
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def get_football_live(api_key, base):
+    response = requests.get(
+        f"{base}/fixtures",
+        headers={"Authorization": f"Bearer {api_key}"},
+        params={
+            "status": "live",
+            "per_page": 100
+        },
+        timeout=25
+    )
+    response.raise_for_status()
+    data = response.json()
+
+    if isinstance(data, list):
+        return data
+
+    return (
+        data.get("data")
+        or data.get("fixtures")
+        or []
+    )
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def get_football_stats(api_key, base, fixture_id):
+    response = requests.get(
+        f"{base}/fixtures/{fixture_id}/statistics",
+        headers={"Authorization": f"Bearer {api_key}"},
+        timeout=20
+    )
+    response.raise_for_status()
+    data = response.json()
+
+    if isinstance(data, dict):
+        return data.get("data") or data.get("statistics") or []
+
+    return data if isinstance(data, list) else []
+
+
+def football_page():
+    st.header("⚽ 足球即時分析")
+
+    if not FOOTBALL_KEY:
+        st.error("尚未設定 FOOTBALL_API_KEY")
+        return
+
+    if st.button("🔄 更新足球賽事"):
+        get_football_live.clear()
+        get_football_stats.clear()
+        st.rerun()
+
+    try:
+        fixtures = get_football_live(
+            FOOTBALL_KEY,
+            FOOTBALL_BASE
+        )
+    except Exception as e:
+        st.error(f"足球賽事讀取失敗：{e}")
+        return
+
+    if not fixtures:
+        st.info("目前沒有取得進行中的足球賽事。")
+        return
+
+    # 從實際回傳的比賽整理聯賽
+    leagues = {}
+
+    for fixture in fixtures:
+        league = fixture.get("league") or {}
+        league_id = league.get("id", "unknown")
+        league_name = league.get("name", "其他聯賽")
+
+        leagues[str(league_id)] = league_name
+
+    league_options = {
+        "全部聯賽": "all"
+    }
+
+    for league_id, league_name in sorted(
+        leagues.items(),
+        key=lambda x: x[1]
+    ):
+        league_options[league_name] = league_id
+
+    selected_league = st.selectbox(
+        "選擇足球聯賽",
+        list(league_options.keys())
+    )
+
+    selected_id = league_options[selected_league]
+
+    if selected_id != "all":
+        fixtures = [
+            f for f in fixtures
+            if str((f.get("league") or {}).get("id"))
+            == selected_id
+        ]
+
+    st.caption(f"目前共有 {len(fixtures)} 場符合條件的賽事")
+
+    for fixture in fixtures:
+        fixture_id = fixture.get("id")
+        home = fixture.get("home") or {}
+        away = fixture.get("away") or {}
+        league = fixture.get("league") or {}
+        goals = fixture.get("goals") or {}
+        score = fixture.get("score") or {}
+        status = fixture.get("status") or {}
+
+        home_name = home.get("name", "主隊")
+        away_name = away.get("name", "客隊")
+
+        home_score = goals.get("home", 0) or 0
+        away_score = goals.get("away", 0) or 0
+
+        elapsed = (
+            status.get("elapsed")
+            or status.get("minute")
+            or 0
+        )
+
+        with st.expander(
+            f"{home_name} {home_score} : "
+            f"{away_score} {away_name}｜"
+            f"{elapsed}'"
+        ):
+            st.write(f"聯賽：{league.get('name', '未知聯賽')}")
+            st.write(f"比賽時間：{elapsed} 分鐘")
+
+            if not fixture_id:
+                st.warning("缺少賽事 ID，無法取得統計。")
+                continue
+
+            try:
+                stats = get_football_stats(
+                    FOOTBALL_KEY,
+                    FOOTBALL_BASE,
+                    fixture_id
+                )
+
+                if not stats:
+                    st.info("目前沒有取得球隊統計。")
+                    continue
+
+                st.markdown("#### 比賽數據")
+
+                for team_stats in stats:
+                    team = team_stats.get("team") or {}
+                    team_name = team.get("name", "球隊")
+
+                    st.markdown(f"**{team_name}**")
+
+                    values = team_stats.get("statistics") or []
+
+                    for item in values:
+                        st.write(
+                            f"{item.get('type', '數據')}："
+                            f"{item.get('value', '-')}"
+                        )
+
+            except Exception as e:
+                st.warning(f"統計資料讀取失敗：{e}")
+                # ---------------- NBA 分析 ----------------
+
+NBA_SCOREBOARD = (
+    "https://site.api.espn.com/apis/site/v2/"
+    "sports/basketball/nba/scoreboard"
+)
+
+NBA_SUMMARY = (
+    "https://site.api.espn.com/apis/site/v2/"
+    "sports/basketball/nba/summary"
+)
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def get_nba_games():
+    response = requests.get(
+        NBA_SCOREBOARD,
+        timeout=20
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def get_nba_summary(event_id):
+    response = requests.get(
+        NBA_SUMMARY,
+        params={"event": event_id},
+        timeout=20
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+def nba_page():
+    st.header("🏀 NBA 即時分析")
+
+    if st.button("🔄 更新 NBA 賽事"):
+        get_nba_games.clear()
+        get_nba_summary.clear()
+        st.rerun()
+
+    try:
+        data = get_nba_games()
+    except Exception as e:
+        st.error(f"NBA 賽事讀取失敗：{e}")
+        return
+
+    events = data.get("events", [])
+
+    if not events:
+        st.info("目前沒有 NBA 賽事。")
+        return
+
+    options = {}
+
+    for event in events:
+        competitors = (
+            event.get("competitions", [{}])[0]
+            .get("competitors", [])
+        )
+
+        names = []
+        for team in competitors:
+            names.append(
+                team.get("team", {}).get("displayName", "未知球隊")
+            )
+
+        label = " vs ".join(names) or event.get("name", "NBA 賽事")
+        options[label] = event.get("id")
+
+    selected = st.selectbox(
+        "選擇 NBA 賽事",
+        list(options.keys())
+    )
+
+    event_id = options[selected]
+
+    try:
+        summary = get_nba_summary(event_id)
+    except Exception as e:
+        st.error(f"NBA 比賽資料讀取失敗：{e}")
+        return
+
+    boxscore = summary.get("boxscore", {})
+    teams = boxscore.get("players", [])
+
+    event_data = next(
+        (e for e in events if e.get("id") == event_id),
+        {}
+    )
+
+    competition = (
+        event_data.get("competitions", [{}])[0]
+    )
+
+    competitors = competition.get("competitors", [])
+
+    current_score = 0
+    total_minutes = 48
+    elapsed_minutes = 0
+
+    for team in competitors:
+        score = team.get("score")
+        if score is not None:
+            try:
+                current_score += int(score)
+            except (ValueError, TypeError):
+                pass
+
+    status = event_data.get("status", {})
+    status_type = status.get("type", {})
+    status_name = status_type.get("detail", "未知")
+
+    period = status.get("period", 0)
+    clock = status.get("displayClock", "12:00")
+
+    if period:
+        try:
+            remaining = float(clock)
+        except (ValueError, TypeError):
+            remaining = 12
+
+        elapsed_minutes = (
+            (period - 1) * 12 + (12 - remaining)
+        )
+
+    st.markdown(f"### {selected}")
+    st.write(f"比賽狀態：{status_name}")
+    st.write(f"目前總分：{current_score}")
+    st.write(f"節數：第 {period} 節")
+    st.write(f"剩餘時間：{clock}")
+
+    if elapsed_minutes > 0:
+        remaining_minutes = max(
+            total_minutes - elapsed_minutes,
+            0
+        )
+
+        pace = current_score / elapsed_minutes
+        projected_total = (
+            current_score + pace * remaining_minutes
+        )
+
+        st.markdown("### 📈 全場大小分預估")
+        st.metric(
+            "預估全場總分",
+            f"{projected_total:.1f}"
+        )
+
+        st.caption(
+            "此數值為目前得分節奏推算，不是實際莊家盤口。"
+        )
+
+        line = st.number_input(
+            "輸入目前全場大小分盤口",
+            min_value=100.0,
+            max_value=350.0,
+            value=220.5,
+            step=0.5
+        )
+
+        if st.button("計算 NBA 大小分機率"):
+            expected_remaining = max(
+                projected_total - current_score,
+                0
+            )
+
+            over, under, push = ou_probabilities(
+                current_score,
+                line,
+                expected_remaining
+            )
+
+            col1, col2, col3 = st.columns(3)
+            col1.metric("大分機率", pct(over))
+            col2.metric("小分機率", pct(under))
+            col3.metric("走水機率", pct(push))
+
+    else:
+        st.info("比賽尚未開始，等待開賽後即可進行走地節奏分析。")
+
+    st.markdown("### 📊 NBA 賽前盤口")
+    show_prematch_odds(4, "NBA")
+
+
+# ---------------- 頁面切換 ----------------
+
+if sport_tab == "⚽ 足球":
+    football_page()
+
+    st.divider()
+    st.subheader("📊 足球賽前盤口")
+
+    api_key = st.secrets.get("THERUNDOWN_API_KEY", "")
+
+    if api_key:
+        try:
+            soccer_leagues = rundown_soccer_sports(api_key)
+
+            if soccer_leagues:
+                league_names = {
+                    name: sid
+                    for sid, name in soccer_leagues.items()
+                }
+
+                selected_name = st.selectbox(
+                    "選擇賽前盤口聯賽",
+                    list(league_names.keys()),
+                    key="prematch_soccer_league"
+                )
+
+                show_prematch_odds(
+                    league_names[selected_name],
+                    selected_name
+                )
+
+        except Exception as e:
+            st.warning(f"足球聯賽目錄讀取失敗：{e}")
+
+    else:
+        st.warning("尚未設定 THERUNDOWN_API_KEY")
+
+else:
+    nba_page()
