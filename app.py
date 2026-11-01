@@ -20,7 +20,7 @@ def get_live_fixtures(api_base, api_key):
     response = requests.get(
         f"{api_base}/fixtures",
         headers={"Authorization": f"Bearer {api_key}"},
-        params={"status": "live", "per_page": 50, "include": "stats", "lang": "zh-tw"},
+        params={"per_page": 50, "include": "stats", "lang": "zh-tw"},
         timeout=25,
     )
     if response.status_code >= 400:
