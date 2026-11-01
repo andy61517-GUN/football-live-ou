@@ -138,7 +138,7 @@ def rundown_events(api_key, sport_id, date_text):
     url = f"{TR_BASE}/sports/{sport_id}/events/{date_text}"
     params = {
         "market_ids": "1,2,3",
-        "affiliate_ids": "3,19,23",
+       "affiliate_ids": "19,22,23",
         "main_line": "true",
         "hide_closed": "true"
     }
@@ -154,6 +154,139 @@ def rundown_events(api_key, sport_id, date_text):
 
 
 def show_prematch_odds(sport_id, sport_label):
+    st.markdown("### 📊 賽前盤口（TheRundown）")
+
+    api_key = st.secrets.get("THERUNDOWN_API_KEY", "")
+    if not api_key:
+        st.warning("尚未設定 THERUNDOWN_API_KEY")
+        return
+
+    from datetime import datetime, timezone
+
+    date_text = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    if st.button("🔄 更新賽前盤口", key=f"refresh_{sport_id}"):
+        rundown_events.clear()
+        st.rerun()
+
+    try:
+        payload = rundown_events(api_key, sport_id, date_text)
+    except requests.HTTPError as e:
+        st.error(f"API HTTP 錯誤：{e}")
+        return
+    except Exception as e:
+        st.error(f"盤口讀取失敗：{e}")
+        return
+
+    events = payload.get("events", [])
+
+    if not events:
+        st.warning("目前日期沒有回傳賽事盤口。")
+        with st.expander("查看 API 回傳內容"):
+            st.json(payload)
+        return
+
+    def get_team_names(event):
+        teams = event.get("teams", [])
+        if isinstance(teams, dict):
+            teams = list(teams.values())
+
+        names = []
+        for team in teams:
+            if isinstance(team, dict):
+                names.append(
+                    team.get("name")
+                    or team.get("display_name")
+                    or ""
+                )
+        return " vs ".join(n for n in names if n)
+
+    labels = [
+        get_team_names(e) or str(e.get("event_id", "賽事"))
+        for e in events
+    ]
+
+    selected = st.selectbox(
+        "選擇要查看的賽事",
+        labels,
+        key=f"event_{sport_id}"
+    )
+
+    event = events[labels.index(selected)]
+    markets = event.get("markets", [])
+
+    rows = []
+
+    for market in markets:
+        market_id = market.get("market_id", market.get("id"))
+        market_name = market.get("name", f"市場 {market_id}")
+
+        for participant in market.get("participants", []):
+            participant_name = (
+                participant.get("name")
+                or participant.get("type")
+                or "選項"
+            )
+
+            for line in participant.get("lines", []):
+                line_value = line.get("value", line.get("line", "-"))
+
+                prices = line.get("prices", {})
+
+                if isinstance(prices, dict):
+                    price_items = prices.items()
+                elif isinstance(prices, list):
+                    price_items = [
+                        (str(i), p)
+                        for i, p in enumerate(prices)
+                    ]
+                else:
+                    continue
+
+                for affiliate_id, price in price_items:
+                    if not isinstance(price, dict):
+                        continue
+
+                    odds = (
+                        price.get("price")
+                        or price.get("odds")
+                    )
+
+                    affiliate_name = (
+                        price.get("affiliate_name")
+                        or price.get("name")
+                        or {
+                            "19": "DraftKings",
+                            "22": "BetMGM",
+                            "23": "FanDuel"
+                        }.get(str(affiliate_id), str(affiliate_id))
+                    )
+
+                    if odds is None:
+                        continue
+
+                    rows.append({
+                        "市場": market_name,
+                        "選項": participant_name,
+                        "盤口": line_value,
+                        "莊家": affiliate_name,
+                        "賠率": odds,
+                        "更新時間": price.get("updated_at", "未提供")
+                    })
+
+    if rows:
+        st.dataframe(
+            rows,
+            hide_index=True,
+            use_container_width=True
+        )
+        st.caption(
+            "資料來源：TheRundown｜免費方案約延遲 5 分鐘"
+        )
+    else:
+        st.warning("有取得賽事，但目前沒有解析到有效賠率。")
+        with st.expander("查看第一場賽事原始資料"):
+            st.json(event)
     st.markdown("### 📊 賽前盤口（TheRundown）")
 
     api_key = st.secrets.get("THERUNDOWN_API_KEY", "")
